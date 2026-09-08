@@ -24,7 +24,12 @@ jobs:
       - name: Python setup
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11.8'
+          # Keep in lockstep with the interpreter the image actually ships
+          # (Dockerfile: python:3.13-alpine3.23). This job pinned 3.11.8 while the image
+          # ran 3.10, so the unit suite never executed on the shipped interpreter and a
+          # regression that only reproduces there could not fail CI. Patch version floats,
+          # matching the Dockerfile base. Bump both together. See PER-15358.
+          python-version: '3.13'
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,7 +40,7 @@ jobs:
           pip install ".[dev]"
           pytest -s --cache-clear horizon/tests/
 
-  pdp-tester:
+  build-pdp-image:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -74,6 +79,33 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Save Docker image as artifact
+        run: docker save permitio/pdp-v2:next -o pdp-image.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdp-image
+          path: pdp-image.tar
+          retention-days: 1
+
+  pdp-tester:
+    runs-on: ubuntu-latest
+    needs: build-pdp-image
+    # Cap the run so a hung tester fails fast instead of holding the runner
+    # until GitHub's 360-minute default. The old k3d path was bounded by
+    # `kubectl wait --timeout=600s`; the tester's own max_running_time only
+    # applies in interval mode, not the run-once mode CI uses.
+    timeout-minutes: 15
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pdp-image
+
+      - name: Load Docker image
+        run: docker load -i pdp-image.tar
+
       # Checkout the pdp-tester repository
       - name: Checkout pdp-tester repository
         uses: actions/checkout@v4
@@ -82,43 +114,144 @@ jobs:
           token: ${{ secrets.CLONE_REPO_TOKEN }}
           path: './pdp-tester'
 
-      # Setup Python environment
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # Cache pdp-tester's deps so each run doesn't re-resolve/re-download
+          # from PyPI (faster, and resilient to transient PyPI outages).
+          cache: "pip"
+          cache-dependency-path: pdp-tester/pyproject.toml
 
-      # Install dependencies for pdp-tester
-      - name: Install pdp-tester dependencies
+      # Docker runtime backend: launch the PDP as a local container via aiodocker
+      # (no k3d/Helm/kubectl). This is the runtime the pdp-tester maintainers
+      # recommend for CI and sidesteps the AbsaOSS/k3d-action download breakage
+      # (its default k3d v5.4.6 has no checksums.txt, so install.sh now 404s).
+      - name: Install pdp-tester (docker extra)
         working-directory: ./pdp-tester
-        run: |
-          pip install -r requirements.txt
+        run: pip install -e ".[docker]"
 
-      # Run pdp-tester
-      - name: Run pdp-tester
+      - name: Run PDP tester against the local Docker PDP image
         working-directory: ./pdp-tester
         env:
           TOKEN: ${{ secrets.PDP_TESTER_API_KEY }}
-          LOCAL_TAGS: '["next"]'
-          INCLUDE_TAGS: '[]'
-          AUTO_REMOVE: "False"
-          SKIP_GENERATE: "True"
-          ENABLE_APM: "False"
+          API_URL: https://permitio.api.stg.permit.io
+          # Test the locally built image (loaded above) instead of pulling from
+          # Docker Hub. LOCAL_IMAGE forces the runtime's local-only tag path, so
+          # only permitio/pdp-v2:next is launched.
+          LOCAL_IMAGE: permitio/pdp-v2
+          # Preserve the previous Helm startTimeout, and keep crashed containers
+          # around so the post-mortem step below can read their logs.
+          START_TIMEOUT: "180"
+          AUTO_REMOVE: "false"
+          # pdp-tester's policy.* cases write policy SCHEMA -- roles, resource
+          # types and relations on the stock File/Folder types -- into the shared
+          # staging environment on every run, rather than only facts. This job
+          # checks pdp-tester out at main with no pinned ref and otherwise runs
+          # every case it discovers, so without this it would opt into that churn
+          # silently the moment those cases landed. See permitio/pdp-tester#152.
+          EXCLUDE_TESTS: '["policy.*"]'
         run: |
-          python -m pdp_tester.main
+          set -o pipefail
+          # The default GitHub Actions shell runs with `-e`, so capture the
+          # tester's exit status explicitly (via `|| status=$?`) instead of
+          # letting a non-zero exit abort the step before the log is parsed.
+          status=0
+          python -m pdp_tester --docker --local --tag next --skip-generate 2>&1 | tee /tmp/tester.log || status=$?
+          if grep -q "test cases failed" /tmp/tester.log; then
+            echo "::error::Some test cases failed!"
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::pdp-tester exited with a non-zero status (${status})"
+            exit 1
+          fi
 
-      - name: Print Docker container logs
+      - name: Capture PDP container state and logs
         if: always()
         run: |
-          echo "Fetching logs for all Docker containers..."
-          for container in $(docker ps -aq); do
-            echo "========================================"
-            echo "Logs for container: $container"
-            echo "----------------------------------------"
-            docker logs "$container" || true
-            echo "========================================"
-            echo ""
+          filter="label=pdp-tester.permit.io/managed-by=pdp-tester"
+          echo "=== PDP containers (all states) ==="
+          docker ps -a --filter "$filter" --format '{{.Names}}\t{{.Status}}' || true
+          echo ""
+          echo "=== PDP container logs ==="
+          for name in $(docker ps -a --filter "$filter" --format '{{.Names}}'); do
+            echo "--- ${name} ---"
+            docker logs --tail 200 "$name" 2>&1 || true
           done
+
+  docker-scout:
+    runs-on: ubuntu-latest
+    needs: build-pdp-image
+    if: github.event_name == 'pull_request'
+    permissions:
+      # required to upload the SARIF report
+      security-events: write
+      # required to download the Docker image artifact
+      contents: read
+      # required to create a pull request comment with the SARIF report
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pdp-image
+
+      - name: Load Docker image
+        run: docker load -i pdp-image.tar
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker Scout CVE report (all severities)
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://permitio/pdp-v2:next
+          exit-code: false
+          sarif-file: scout-results.sarif
+          summary: true
+
+      - name: Docker Scout CVE gate (high and critical)
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://permitio/pdp-v2:next
+          only-severities: critical,high
+          exit-code: true
+          # Accept CVEs marked not_affected in the OpenVEX doc (see
+          # .docker/scout/pdp-v2.vex.json) so the gate does not fail on
+          # vulnerabilities whose code path the PDP never executes and for which
+          # no usable fix is available: starlette CVE-2026-48710 / CVE-2026-48817 /
+          # CVE-2026-48818 / CVE-2026-54283, all fixed only in starlette >=1.x, which
+          # OPAL's starlette<1 cap forbids; ddtrace CVE-2026-50271, fixed only in
+          # ddtrace >=4.8.2, which OPAL's ddtrace<4 cap forbids and which the Dockerfile
+          # mitigates by dropping "baggage" from the extract styles; and CPython
+          # CVE-2026-15308 (html.parser DoS), which nothing in the image imports and which
+          # is fixed only in 3.15.0b4, so no released Python clears it yet. See PER-15358.
+          #
+          # NOTE: this gate reads packages, so it does not flag the CPython interpreter
+          # itself the way a CPE-based scanner does - that blind spot is why four Python
+          # CVEs reached a customer scan of 0.9.14-rc1 without failing CI (PER-15532).
+          vex-location: .docker/scout
+          only-vex-affected: true
+          # REQUIRED: docker scout only *applies* VEX statements whose author
+          # matches its accept-list, which defaults to `<.*@docker.com>`. Without
+          # this, our Permit.io-authored statements are matched and displayed
+          # ("VEX: not affected") but NOT suppressed, so the gate still fails on
+          # the waived CVEs. Must match the `author` field in pdp-v2.vex.json.
+          vex-author: Permit.io
+
+      - name: Upload SARIF report
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scout-results.sarif
 
   rust-ci:
     name: Rust CI

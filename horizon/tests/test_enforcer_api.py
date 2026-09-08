@@ -49,6 +49,174 @@ async def pdp_api_client() -> TestClient:
     await stats_manager.stop()
 
 
+PROTECTED_ENFORCER_ENDPOINTS = [
+    "/allowed",
+    "/allowed/bulk",
+    "/allowed/all-tenants",
+    "/allowed_url",
+    "/user-permissions",
+    "/user-tenants",
+    "/authorized_users",
+    "/nginx_allowed",
+    "/kong",
+]
+
+# The malformed-Authorization matrix, shared by every gated router's parametrized 401 test
+# (this file, test_legacy_update_routes.py x2, test_opal_trigger_auth.py). Kept in one place
+# so a new variant lands once instead of four times and cannot silently diverge between
+# routers; the other modules pull it in by basename, same convention as MockPermitPDP.
+#
+# The two non-bearer entries carry the REAL API key, so they 401 *only* because HTTPBearer
+# rejects the scheme (horizon/authentication.py:37-38). Neuter that scheme comparison and
+# these are the entries that go red - the rest still 401 on an empty/wrong credential.
+# Interpolated below `sidecar = MockPermitPDP()`, which is what sets sidecar_config.API_KEY.
+MALFORMED_AUTH_HEADERS = [
+    "garbage",  # no scheme/credential split at all
+    "Bearer",  # scheme, no credential
+    "Bearer ",  # scheme, empty credential
+    "Bearer a b c",  # bearer scheme, credential containing spaces
+    f"Basic {sidecar_config.API_KEY}",  # right secret, wrong scheme -> must still 401
+    f"basic {sidecar_config.API_KEY}",  # ... and lowercasing the scheme must not help either
+]
+
+KONG_QUERY = {
+    "input": {
+        "request": {
+            "http": {
+                "host": "api.example.com",
+                "port": 80,
+                "tls": {},
+                "method": "GET",
+                "scheme": "http",
+                "path": "/resource1/some-id",
+                "querystring": {},
+                "headers": {},
+            }
+        },
+        "client_ip": "127.0.0.1",
+        "consumer": {"id": "b1b2ac9e-a1b6-4c68-b447-a03d13c0e3e3", "username": "user1"},
+    }
+}
+
+
+@pytest.mark.parametrize("endpoint", PROTECTED_ENFORCER_ENDPOINTS)
+def test_enforcer_endpoint_missing_token_returns_401(endpoint):
+    client = TestClient(sidecar._app)
+    response = client.post(endpoint, json={})
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Missing Authorization header"
+
+
+@pytest.mark.parametrize("endpoint", PROTECTED_ENFORCER_ENDPOINTS)
+def test_enforcer_endpoint_invalid_token_returns_401(endpoint):
+    client = TestClient(sidecar._app)
+    response = client.post(endpoint, headers={"authorization": "Bearer wrong_token"}, json={})
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Invalid PDP token"
+
+
+@pytest.mark.parametrize("endpoint", PROTECTED_ENFORCER_ENDPOINTS)
+@pytest.mark.parametrize("value", MALFORMED_AUTH_HEADERS)
+def test_enforcer_endpoint_malformed_header_is_401_not_500(endpoint, value):
+    client = TestClient(sidecar._app)
+    response = client.post(endpoint, headers={"authorization": value}, json={})
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_health_endpoint_is_public(monkeypatch):
+    monkeypatch.setattr(stats_manager, "_had_failure", False)
+    client = TestClient(sidecar._app)
+    response = client.get("/health")
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() == {"status": "ok"}
+
+
+def test_kong_endpoint_valid_token_integration_disabled_returns_503():
+    client = TestClient(sidecar._app)
+    response = client.post(
+        "/kong",
+        headers={"authorization": f"Bearer {sidecar_config.API_KEY}"},
+        json=KONG_QUERY,
+    )
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+def test_kong_endpoint_enabled_integration_allowed_flow(tmp_path, monkeypatch):
+    routes_file = tmp_path / "kong_routes.json"
+    routes_file.write_text('[["^/resource1/.*$", "resource1"]]')
+    monkeypatch.setattr("horizon.enforcer.api.KONG_ROUTES_TABLE_FILE", str(routes_file))
+    monkeypatch.setattr(sidecar_config, "KONG_INTEGRATION", True)
+
+    class FakeStateHandler:
+        async def seen_sdk(self, _sdk: str) -> None:
+            return None
+
+    monkeypatch.setattr("horizon.state.PersistentStateHandler._instance", FakeStateHandler())
+    # isolate the shared stats queue so this test's OPA calls don't leak into the statistics tests
+    monkeypatch.setattr(stats_manager, "_messages", asyncio.Queue())
+
+    kong_sidecar = MockPermitPDP()
+    client = TestClient(kong_sidecar._app)
+
+    response = client.post("/kong", json=KONG_QUERY)
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    with aioresponses() as m:
+        m.post(
+            f"{opal_client_config.POLICY_STORE_URL}/v1/data/permit/root",
+            status=200,
+            payload={"result": {"allow": True}},
+        )
+        response = client.post(
+            "/kong",
+            headers={"authorization": f"Bearer {sidecar_config.API_KEY}"},
+            json=KONG_QUERY,
+        )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() == {"result": True}
+
+
+def test_authorized_users_endpoint_valid_token_allowed_flow(monkeypatch):
+    monkeypatch.setattr(stats_manager, "_messages", asyncio.Queue())
+    client = TestClient(sidecar._app)
+    with aioresponses() as m:
+        m.post(
+            f"{opal_client_config.POLICY_STORE_URL}/v1/data/permit/authorized_users/authorized_users",
+            status=200,
+            payload={"result": {"result": {"resource": "resource1:*", "tenant": "default", "users": {}}}},
+        )
+        response = client.post(
+            "/authorized_users",
+            headers={"authorization": f"Bearer {sidecar_config.API_KEY}"},
+            json={"action": "read", "resource": {"type": "resource1"}},
+        )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["resource"] == "resource1:*"
+
+
+def test_nginx_allowed_endpoint_valid_token_allowed_flow(monkeypatch):
+    monkeypatch.setattr(stats_manager, "_messages", asyncio.Queue())
+    client = TestClient(sidecar._app)
+    with aioresponses() as m:
+        m.post(
+            f"{opal_client_config.POLICY_STORE_URL}/v1/data/permit/root",
+            status=200,
+            payload={"result": {"allow": True}},
+        )
+        response = client.post(
+            "/nginx_allowed",
+            headers={
+                "authorization": f"Bearer {sidecar_config.API_KEY}",
+                "permit-user-key": "user1",
+                "permit-tenant-id": "default",
+                "permit-action": "read",
+                "permit-resource-type": "resource1",
+            },
+        )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["allow"] is True
+
+
 ALLOWED_ENDPOINTS = [
     (
         "/allowed",
@@ -699,7 +867,6 @@ ALLOWED_ENDPOINTS = [
         },
         {"allow": True},
     ),
-    # TODO: Add Kong
 ]
 
 

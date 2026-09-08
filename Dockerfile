@@ -77,7 +77,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   then \
     cd /custom && \
     tar xzf custom_opa.tar.gz && \
-    CGO_ENABLED=0 go build -a -ldflags="-s -w -extldflags=-static" -tags netgo -installsuffix netgo -o /opa && \
+    # permit-opa moved its main package from the repo root to ./cmd/opa
+    # (cmd/ + pkg/ layout); build whichever location the tarball provides
+    if [ -d cmd/opa ]; then main_pkg=./cmd/opa; else main_pkg=.; fi && \
+    CGO_ENABLED=0 go build -a -ldflags="-s -w -extldflags=-static" -tags netgo -installsuffix netgo -o /opa $main_pkg && \
     rm -rf /custom; \
   else \
     case $(uname -m) in \
@@ -90,7 +93,28 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # MAIN IMAGE ----------------------------------------
 # Main image setup (optimized)
 # ---------------------------------------------------
-FROM python:3.10-alpine3.22 AS main
+# Python 3.13 (>= 3.13.14) on Alpine 3.23. Moved off python:3.10-alpine3.22 to clear four
+# CPython CVEs a customer CPE scan raised against pdp-v2 0.9.14-rc1 (PER-15358):
+#   CVE-2026-6019  (http.cookies Morsel.js_output escaping) - fixed in 3.13.14
+#   CVE-2026-7210  (expat hash-flooding entropy)            - fixed in 3.13.14 AND needs
+#                                                             libexpat >= 2.8.0; this image
+#                                                             ships expat 2.8.1
+#   CVE-2023-36632 (email.utils.parseaddr recursion)        - DISPUTED by PSF and never
+#                                                             fixed, but its CPE range is
+#                                                             < 3.11.4, so 3.13 is out of it
+# PSF fixed these only on the 3.13/3.14/3.15 branches - there is no 3.10/3.11/3.12 backport -
+# so the vulnerable code really was present in 3.10.20 and an upgrade was the only fix.
+# CVE-2026-15308 (html.parser DoS) is NOT cleared by this bump: it is patched only in
+# 3.15.0b4 and NVD's range is < 3.15.0, so no released Python satisfies it. It is waived in
+# .docker/scout/pdp-v2.vex.json as unreachable (nothing in the image imports html.parser).
+#
+# The patch version floats deliberately (see the previous python:3.10-alpine3.22 base and
+# the rebuild-picks-it-up posture in PER-15532): when 3.13.15 ships it will clear
+# CVE-2026-15308 automatically and that waiver can then be dropped. Do not drop below
+# 3.13.14 - that is the floor for the fixes above.
+#
+# Python 3.10 also reaches end of life in October 2026, so this move was due regardless.
+FROM python:3.13-alpine3.23 AS main
 
 WORKDIR /app
 
@@ -101,14 +125,25 @@ RUN addgroup -S permit -g 1001 && \
 # Create backup directory with permissions
 RUN mkdir -p /app/backup && chmod -R 777 /app/backup
 
-# Install necessary libraries and delete SQLite in a single RUN command
-# Use cache mount for apk to speed up package downloads
+# Install runtime libraries and remove sqlite-libs.
+# Build deps (build-base, *-dev) are installed and removed in the pip install
+# layer to avoid persisting binutils CVEs (CVE-2025-69649, CVE-2025-69650).
+#
+# The PDP never uses SQLite, but its FTS5/zipfile CVEs (CVE-2026-11822,
+# CVE-2026-11824, CVE-2025-70873) are still reported against sqlite-libs, which
+# the official python:alpine image pins via the .python-rundeps virtual package.
+# A plain `apk del sqlite-libs` is refused (that pin), and deleting the virtual
+# cascade-purges the whole python runtime. So re-pin every OTHER python runtime
+# shared object under a fresh virtual (derived dynamically, so it is
+# arch-agnostic), then drop the original pin together with sqlite-libs.
 RUN --mount=type=cache,target=/var/cache/apk \
     ln -s /var/cache/apk /etc/apk/cache && \
     apk update && \
     apk upgrade && \
-    apk add bash build-base libffi-dev libressl-dev musl-dev zlib-dev gcompat wget && \
-    apk del sqlite
+    apk add bash libffi libressl gcompat && \
+    apk add --no-cache --virtual .python-rundeps-nosqlite \
+        $(apk info -qR .python-rundeps | grep '^so:' | grep -v 'libsqlite3') && \
+    apk del .python-rundeps sqlite-libs
 
 
 # Copy OPA binary from the build stage
@@ -139,10 +174,12 @@ USER root
 # Use cache mount for pip to speed up incremental builds
 COPY ./requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
+    apk add --no-cache --virtual .build-deps build-base libffi-dev libressl-dev musl-dev zlib-dev && \
     pip install --upgrade pip setuptools && \
     pip install -r requirements.txt && \
     python -m pip uninstall -y pip setuptools wheel && \
-    rm -r /usr/local/lib/python3.10/ensurepip
+    rm -r /usr/local/lib/python3.13/ensurepip && \
+    apk del .build-deps
 
 USER permit
 
@@ -164,6 +201,20 @@ ENV OPAL_LOG_TRACEBACK="false"
 ENV OPAL_LOG_MODULE_EXCLUDE_LIST="[]"
 ENV OPAL_INLINE_OPA_ENABLED="true"
 ENV OPAL_INLINE_OPA_LOG_FORMAT="http"
+
+# datadog / ddtrace configuration -------------------
+# Drop "baggage" from ddtrace's default extract styles ("datadog,tracecontext,baggage").
+# CVE-2026-50271: ddtrace's W3C baggage propagator does not enforce
+# DD_TRACE_BAGGAGE_MAX_ITEMS / DD_TRACE_BAGGAGE_MAX_BYTES on the *extract* path, so an
+# unauthenticated caller can force unbounded CPU/memory use with an oversized baggage
+# header. The fix is only in ddtrace >= 4.8.2, which opal-common's `ddtrace<4,>=3.0.0`
+# cap forbids, so we remove the vulnerable parser from the request path instead.
+#
+# This only matters when PDP_ENABLE_MONITORING=true (default false) - that is what calls
+# patch(fastapi=True) and puts ddtrace on the inbound request path at all. Injection is
+# left at its default, so outbound baggage propagation is unaffected. Remove this once
+# OPAL relaxes its ddtrace<4 bound and ddtrace moves to >= 4.8.2. See PER-15358.
+ENV DD_TRACE_PROPAGATION_STYLE_EXTRACT="datadog,tracecontext"
 
 # horizon configuration -----------------------------
 # by default, the backend is at port 8000 on the docker host
